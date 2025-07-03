@@ -29,6 +29,92 @@ from ...loaders import FromOriginalModelMixin
 from ...utils.accelerate_utils import apply_forward_hook
 
 
+class LTXVideoConv2dSplitUpsampler(nn.Module):
+    def __init__(
+            self,
+            in_channels: int,
+            kernel_size: Union[int, Tuple[int, int]] = 3,
+            stride: Union[int, Tuple[int, int]] = 1,
+            upscale_factor: int = 1,
+            padding_mode: str = "zeros",
+    ):
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.stride = stride if isinstance(stride, tuple) else (stride, stride)
+        self.upscale_factor = upscale_factor
+
+        out_channels = in_channels
+
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size)
+
+        height_pad = self.kernel_size[0] // 2
+        width_pad = self.kernel_size[1] // 2
+        padding = (height_pad, width_pad)
+
+        self.conv = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=self.kernel_size,
+            stride=1,
+            padding=padding,
+            padding_mode=padding_mode,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.conv(hidden_states)
+        hidden_states = torch.nn.functional.pixel_shuffle(hidden_states, self.stride[0])
+
+        return hidden_states
+
+
+class LTXVideoConv2dUpsampler(nn.Module):
+    def __init__(
+            self,
+            in_channels: int,
+            kernel_size: Union[int, Tuple[int, int]] = 3,
+            stride: Union[int, Tuple[int, int]] = 1,
+            upscale_factor: int = 1,
+            padding_mode: str = "zeros",
+    ):
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.stride = stride if isinstance(stride, tuple) else (stride, stride)
+        self.upscale_factor = upscale_factor
+
+        # out_channels = (in_channels * stride[0] * stride[1]) // upscale_factor
+        out_channels = in_channels
+
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size)
+
+        height_pad = self.kernel_size[0] // 2
+        width_pad = self.kernel_size[1] // 2
+        padding = (height_pad, width_pad)
+
+        self.conv = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=self.kernel_size,
+            stride=1,
+            padding=padding,
+            padding_mode=padding_mode,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, channels, time_steps, height, width = hidden_states.shape
+        # import pdb;pdb.set_trace()
+        hidden_states = hidden_states.permute(0, 2, 1, 3, 4).reshape(batch_size * time_steps, channels, height, width)
+
+        hidden_states = self.conv(hidden_states)
+        hidden_states = torch.nn.functional.pixel_shuffle(hidden_states, self.stride[0])
+        _, _, output_height, output_width = hidden_states.shape
+        hidden_states = hidden_states.reshape(batch_size, time_steps, -1, output_height, output_width)
+        hidden_states = hidden_states.permute(0, 2, 1, 3, 4)
+
+        return hidden_states
+
+
 class LTXVideoCausalConv3d(nn.Module):
     def __init__(
             self,
@@ -1022,12 +1108,17 @@ class LTXVideoDecoder3d(nn.Module):
             upsample_factor: Tuple[bool, ...] = (1, 1, 1, 1),
             decoder_is_dw_conv: Tuple[bool, ...] = (False, False, False, False, False),
             decoder_dw_kernel_size: int = 3,
+            is_upsample_modified: bool = False,
+            decoder_is_pn: bool = False,
+            spatio_only: Tuple[bool, ...] = (False, False, False, False),
     ) -> None:
         super().__init__()
 
         self.patch_size = patch_size
         self.patch_size_t = patch_size_t
-        self.out_channels = out_channels * patch_size ** 2
+        self.out_channels = out_channels
+
+        self.is_pixelnorm = decoder_is_pn
 
         block_out_channels = tuple(reversed(block_out_channels))
         spatio_temporal_scaling = tuple(reversed(spatio_temporal_scaling))
@@ -1035,8 +1126,9 @@ class LTXVideoDecoder3d(nn.Module):
         inject_noise = tuple(reversed(inject_noise))
         upsample_residual = tuple(reversed(upsample_residual))
         upsample_factor = tuple(reversed(upsample_factor))
-        output_channel = block_out_channels[0]
         decoder_is_dw_conv = tuple(reversed(decoder_is_dw_conv))
+        spatio_only = tuple(reversed(spatio_only))
+        output_channel = block_out_channels[0]
 
         self.conv_in = LTXVideoCausalConv3d(
             in_channels=in_channels, out_channels=output_channel, kernel_size=3, stride=1, is_causal=is_causal
@@ -1050,7 +1142,8 @@ class LTXVideoDecoder3d(nn.Module):
             inject_noise=inject_noise[0],
             timestep_conditioning=timestep_conditioning,
             is_dw_conv=decoder_is_dw_conv[0],
-            dw_kernel_size=decoder_dw_kernel_size
+            dw_kernel_size=decoder_dw_kernel_size,
+            # is_pixelnorm=decoder_is_pn,
         )
 
         # up blocks
@@ -1073,13 +1166,36 @@ class LTXVideoDecoder3d(nn.Module):
                 upscale_factor=upsample_factor[i],
                 is_dw_conv=decoder_is_dw_conv[i + 1],
                 dw_kernel_size=decoder_dw_kernel_size,
+                # is_upsample_modified=is_upsample_modified,
+                # is_pixelnorm=decoder_is_pn,
+                # spatio_only=spatio_only[i],
             )
 
             self.up_blocks.append(up_block)
 
+        self.norm_up_1 = RMSNorm(out_channels, eps=1e-8, elementwise_affine=False)
+
+        self.upsampler2d_1 = LTXVideoConv2dSplitUpsampler(
+            in_channels=output_channel,
+            kernel_size=3,
+            stride=(2, 2),
+        )
+
+        output_channel = output_channel // (2 * 2)
+        self.norm_up_2 = RMSNorm(out_channels, eps=1e-8, elementwise_affine=False)
+
+        self.upsampler2d_2 = LTXVideoConv2dUpsampler(
+            in_channels=output_channel,
+            kernel_size=3,
+            stride=(2, 2),
+        )
+
+        output_channel = output_channel // (2 * 2)
+
         # out
         self.norm_out = RMSNorm(out_channels, eps=1e-8, elementwise_affine=False)
         self.conv_act = nn.SiLU()
+
         self.conv_out = LTXVideoCausalConv3d(
             in_channels=output_channel, out_channels=self.out_channels, kernel_size=3, stride=1, is_causal=is_causal
         )
@@ -1087,33 +1203,42 @@ class LTXVideoDecoder3d(nn.Module):
         # timestep embedding
         self.time_embedder = None
         self.scale_shift_table = None
-        self.timestep_scale_multiplier = None
         if timestep_conditioning:
-            self.timestep_scale_multiplier = nn.Parameter(torch.tensor(1000.0, dtype=torch.float32))
             self.time_embedder = PixArtAlphaCombinedTimestepSizeEmbeddings(output_channel * 2, 0)
             self.scale_shift_table = nn.Parameter(torch.randn(2, output_channel) / output_channel ** 0.5)
 
         self.gradient_checkpointing = False
 
-    def forward(self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None,
+                feature_enabled: bool = False) -> torch.Tensor:
         hidden_states = self.conv_in(hidden_states)
-
-        if self.timestep_scale_multiplier is not None:
-            temb = temb * self.timestep_scale_multiplier
-
+        feature_backup = {}
         if torch.is_grad_enabled() and self.gradient_checkpointing:
-            hidden_states = self._gradient_checkpointing_func(self.mid_block, hidden_states, temb)
+
+            def create_custom_forward(module):
+                def create_forward(*inputs):
+                    return module(*inputs)
+
+                return create_forward
+
+            hidden_states = torch.utils.checkpoint.checkpoint(
+                create_custom_forward(self.mid_block), hidden_states, temb
+            )
 
             for up_block in self.up_blocks:
-                hidden_states = self._gradient_checkpointing_func(up_block, hidden_states, temb)
+                hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(up_block), hidden_states, temb)
         else:
             hidden_states = self.mid_block(hidden_states, temb)
+            if feature_enabled:
+                feature_backup["mid_block"] = hidden_states
 
-            for up_block in self.up_blocks:
+            for index, up_block in enumerate(self.up_blocks):
                 hidden_states = up_block(hidden_states, temb)
+                if feature_enabled:
+                    feature_backup[f"up_block_{index}"] = hidden_states
 
-        # hidden_states = self.norm_out(hidden_states.movedim(1, -1)).movedim(-1, 1)
-        hidden_states = self.norm_out(hidden_states.permute(0, 2, 3, 4, 1)).permute(0, 4, 1, 2, 3)
+        # hidden_states = self.norm_up_1(hidden_states.movedim(1, -1)).movedim(-1, 1)
+        hidden_states = self.norm_up_1(hidden_states.permute(0, 2, 3, 4, 1)).permute(0, 4, 1, 2, 3)
 
         if self.time_embedder is not None:
             temb = self.time_embedder(
@@ -1129,18 +1254,29 @@ class LTXVideoDecoder3d(nn.Module):
             hidden_states = hidden_states * (1 + scale) + shift
 
         hidden_states = self.conv_act(hidden_states)
+
+        # hidden_states = self.upsampler2d_1(hidden_states)
+        hidden_states_array = []
+        for t in range(hidden_states.shape[2]):
+            h = self.upsampler2d_1(hidden_states[:, :, t, :, :])
+            hidden_states_array.append(h)
+        hidden_states = torch.stack(hidden_states_array, dim=2)
+        # hidden_states = self.norm_up_2(hidden_states.movedim(1, -1)).movedim(-1, 1)
+        hidden_states = self.norm_up_2(hidden_states.permute(0, 2, 3, 4, 1)).permute(0, 4, 1, 2, 3)
+        hidden_states = self.conv_act(hidden_states)
+
+        hidden_states = self.upsampler2d_2(hidden_states)
+
+        # hidden_states = self.norm_out(hidden_states.movedim(1, -1)).movedim(-1, 1)
+        hidden_states = self.norm_out(hidden_states.permute(0, 2, 3, 4, 1)).permute(0, 4, 1, 2, 3)
+        hidden_states = self.conv_act(hidden_states)
+
         hidden_states = self.conv_out(hidden_states)
 
-        p = self.patch_size
-        p_t = self.patch_size_t
-
-        batch_size, num_channels, num_frames, height, width = hidden_states.shape
-        hidden_states = hidden_states.reshape(batch_size, -1, p, p, num_frames, height, width)
-        hidden_states = hidden_states.permute(0, 1, 4, 3, 2, 5, 6).flatten(3, 4)
-        hidden_states = hidden_states.reshape(-1, p * p, height, width)
-        hidden_states = torch.nn.functional.pixel_shuffle(hidden_states, p).reshape(batch_size, -1, num_frames,
-                                                                                    height * p, width * p)
-        return hidden_states
+        if feature_enabled:
+            return hidden_states, feature_backup
+        else:
+            return hidden_states
 
 
 class AutoencoderKLLTXVideo(ModelMixin, ConfigMixin, FromOriginalModelMixin):
@@ -1218,6 +1354,9 @@ class AutoencoderKLLTXVideo(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             temporal_compression_ratio: int = None,
             decoder_is_dw_conv: Tuple[bool, ...] = (False, False, False, False, False),
             decoder_dw_kernel_size: int = 3,
+            is_decoder_modified: bool = False,
+            decoder_is_pn: bool = False,
+            decoder_is_upsample_modified: bool = False,
     ) -> None:
         super().__init__()
 
