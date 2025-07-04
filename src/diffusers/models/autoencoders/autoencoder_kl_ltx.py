@@ -818,6 +818,7 @@ class LTXVideoUpBlock3d(nn.Module):
             upscale_factor: int = 1,
             is_dw_conv: bool = False,
             dw_kernel_size: int = 3,
+            spatio_only: bool = False,
     ):
         super().__init__()
 
@@ -844,11 +845,12 @@ class LTXVideoUpBlock3d(nn.Module):
 
         self.upsamplers = None
         if spatio_temporal_scale:
+            stride_up = (2, 2, 2) if not spatio_only else (1, 2, 2)
             self.upsamplers = nn.ModuleList(
                 [
                     LTXVideoUpsampler3d(
                         out_channels * upscale_factor,
-                        stride=(2, 2, 2),
+                        stride=stride_up,
                         is_causal=is_causal,
                         residual=upsample_residual,
                         upscale_factor=upscale_factor,
@@ -1168,7 +1170,7 @@ class LTXVideoDecoder3d(nn.Module):
                 dw_kernel_size=decoder_dw_kernel_size,
                 # is_upsample_modified=is_upsample_modified,
                 # is_pixelnorm=decoder_is_pn,
-                # spatio_only=spatio_only[i],
+                spatio_only=spatio_only[i],
             )
 
             self.up_blocks.append(up_block)
@@ -1357,6 +1359,7 @@ class AutoencoderKLLTXVideo(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             is_decoder_modified: bool = False,
             decoder_is_pn: bool = False,
             decoder_is_upsample_modified: bool = False,
+            decoder_spatio_only: Tuple[bool, ...] = (False, False, False, False),
     ) -> None:
         super().__init__()
 
@@ -1389,6 +1392,7 @@ class AutoencoderKLLTXVideo(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             upsample_factor=upsample_factor,
             decoder_is_dw_conv=decoder_is_dw_conv,
             decoder_dw_kernel_size=decoder_dw_kernel_size,
+            spatio_only=decoder_spatio_only,
         )
 
         latents_mean = torch.zeros((latent_channels,), requires_grad=False)
